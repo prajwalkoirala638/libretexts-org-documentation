@@ -44,21 +44,21 @@ func main() { // Starts the program.
 	} // Ends the directory error check.
 
 	for page := 1; ; page++ { // Continues requesting pages until the API returns an empty books array.
-		u, err := url.Parse(baseURL + "/api/v1/commons/catalog") // Creates the catalog API URL.
-		if err != nil {                                          // Checks whether the URL could not be parsed.
+		urls, err := url.Parse(baseURL + "/api/v1/commons/catalog") // Creates the catalog API URL.
+		if err != nil {                                             // Checks whether the URL could not be parsed.
 			fmt.Println("URL error:", err) // Prints the URL error.
 			return                         // Stops the program.
 		} // Ends the URL error check.
 
-		q := u.Query()                          // Gets the URL query parameters.
-		q.Set("activePage", strconv.Itoa(page)) // Sets the current catalog page.
-		q.Set("limit", strconv.Itoa(pageSize))  // Sets the number of books requested.
-		u.RawQuery = q.Encode()                 // Adds the query parameters to the URL.
+		query := urls.Query()                       // Gets the URL query parameters.
+		query.Set("activePage", strconv.Itoa(page)) // Sets the current catalog page.
+		query.Set("limit", strconv.Itoa(pageSize))  // Sets the number of books requested.
+		urls.RawQuery = query.Encode()              // Adds the query parameters to the URL.
 
 		fmt.Printf("\nGetting catalog page %d...\n", page) // Shows which page is being requested.
 
-		resp, err := client.Get(u.String()) // Requests the catalog page.
-		if err != nil {                     // Checks whether the API request failed.
+		resp, err := client.Get(urls.String()) // Requests the catalog page.
+		if err != nil {                        // Checks whether the API request failed.
 			fmt.Println("Catalog error:", err) // Prints the API error.
 			return                             // Stops the program on an API error.
 		} // Ends the request error check.
