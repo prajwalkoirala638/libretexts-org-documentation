@@ -36,7 +36,7 @@ const ( // Starts the block of fixed configuration constants.
 	httpRequestTimeout     = 2 * time.Minute                                                                                                  // Maximum time allowed for any single HTTP request to complete.
 	firstCatalogPageNumber = 1                                                                                                                // Catalog page number the program starts requesting from.
 	httpUserAgent          = "Mozilla/5.0 (X11; CrOS x86_64 14541.0.0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36" // User-Agent header sent with every outgoing HTTP request.
-	pauseAfterEachDownload = 3 * time.Second                                                                                                  // How long to pause after each successful PDF download, to be gentle on the server.
+	pauseAfterEachDownload = 1 * time.Second                                                                                                  // How long to pause after each successful PDF download, to be gentle on the server.
 ) // Ends the configuration constants.
 
 // runConfiguration bundles the constants above into a single struct so the
