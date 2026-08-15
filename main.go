@@ -2,6 +2,8 @@ package main // Defines this file as an executable Go program (package main mean
 
 import ( // Starts the list of standard-library packages this program depends on.
 	"context"       // Lets us cancel in-flight work cleanly on Ctrl+C or a termination signal.
+	"crypto/sha256" // Computes SHA-256 checksums so we can verify a downloaded PDF wasn't corrupted on the way to disk.
+	"encoding/hex"  // Renders raw checksum bytes as a human-readable hexadecimal string for logging and comparison.
 	"encoding/json" // Decodes JSON responses returned by the LibreTexts catalog API.
 	"fmt"           // Formats strings for log messages and error messages.
 	"io"            // Streams downloaded PDF bytes from the HTTP response into a file on disk.
@@ -281,11 +283,15 @@ func performCatalogPageRequest(shutdownContext context.Context, httpClient *http
 	httpRequest.Header.Set("User-Agent", configuration.userAgent) // Identifies this program to the server using the configured User-Agent string.
 	httpRequest.Header.Set("Accept", "application/json")          // Tells the server we expect a JSON response body.
 
+	log.Printf("requesting catalog page %d: %s", pageNumber, catalogURL.String()) // Logs the exact catalog URL being requested, so the network activity is fully traceable in the logs.
+
 	httpResponse, requestError := httpClient.Do(httpRequest) // Sends the catalog request over the network.
 	if requestError != nil {                                 // Checks whether the network request itself failed (timeout, DNS failure, connection refused, etc).
 		return catalogResponse{}, fmt.Errorf("request error: %w", requestError) // Returns a wrapped network error.
 	} // Ends the request-error check.
 	defer httpResponse.Body.Close() // Ensures the response body is always closed, even if decoding fails below.
+
+	log.Printf("received HTTP %d for catalog page %d", httpResponse.StatusCode, pageNumber) // Logs the response status as soon as headers arrive, before the body is decoded.
 
 	if httpResponse.StatusCode < 200 || httpResponse.StatusCode >= 300 { // Checks whether the server returned a non-success (non-2xx) HTTP status code.
 		return catalogResponse{}, fmt.Errorf("HTTP %d from catalog API", httpResponse.StatusCode) // Returns an error describing the unexpected status code.
@@ -323,10 +329,12 @@ func downloadBookPDF(shutdownContext context.Context, httpClient *http.Client, c
 
 	finalFilePath := filepath.Join(configuration.outputDirectory, book.BookID+".pdf") // Builds the path where the completed PDF will ultimately live.
 
+	log.Printf("book %s: source URL=%s destination path=%s", book.BookID, book.Links.PDF, finalFilePath) // Logs exactly where this PDF is coming from and where it will be saved, before anything else happens.
+
 	if existingFileInfo, statError := os.Stat(finalFilePath); statError == nil && existingFileInfo.Size() > 0 { // Checks whether a non-empty PDF already exists at that path.
-		log.Printf("skip %s: already downloaded (%s)", book.BookID, formatByteCountForHumans(existingFileInfo.Size())) // Reports that this book was already downloaded in a previous run.
-		statistics.booksSkipped.Add(1)                                                                                 // Records the skip in the run statistics.
-		return                                                                                                         // Leaves the existing file untouched.
+		log.Printf("skip %s: already downloaded (%s) at %s", book.BookID, formatByteCountForHumans(existingFileInfo.Size()), finalFilePath) // Reports that this book was already downloaded in a previous run, including where the existing file lives.
+		statistics.booksSkipped.Add(1)                                                                                                      // Records the skip in the run statistics.
+		return                                                                                                                              // Leaves the existing file untouched.
 	} // Ends the existing-file check.
 
 	var mostRecentError error // Tracks the most recent attempt's error, used in the final failure log if every attempt fails.
@@ -347,11 +355,13 @@ func downloadBookPDF(shutdownContext context.Context, httpClient *http.Client, c
 			} // Ends the backoff wait.
 		} // Ends the retry-delay branch.
 
+		log.Printf("attempt %d/%d for %s: downloading %s -> %s", attemptNumber+1, configuration.maximumRetries+1, book.BookID, book.Links.PDF, finalFilePath) // Logs which attempt this is and the exact source-to-destination mapping being tried.
+
 		bytesWrittenThisAttempt, downloadError := performSingleDownloadAttempt(shutdownContext, httpClient, configuration, book, finalFilePath) // Performs exactly one full download attempt for this book.
 		if downloadError == nil {                                                                                                               // Checks whether this attempt succeeded.
-			log.Printf("done %s: wrote %s", book.BookID, formatByteCountForHumans(bytesWrittenThisAttempt)) // Logs the successful download and how many bytes were written.
-			statistics.booksDownloaded.Add(1)                                                               // Records the success in the run statistics.
-			statistics.totalBytesWritten.Add(bytesWrittenThisAttempt)                                       // Adds the bytes written by this download to the running total.
+			log.Printf("done %s: wrote %s to %s (from %s)", book.BookID, formatByteCountForHumans(bytesWrittenThisAttempt), finalFilePath, book.Links.PDF) // Logs the successful download, how many bytes were written, and both the source URL and destination path.
+			statistics.booksDownloaded.Add(1)                                                                                                              // Records the success in the run statistics.
+			statistics.totalBytesWritten.Add(bytesWrittenThisAttempt)                                                                                      // Adds the bytes written by this download to the running total.
 
 			log.Printf("sleeping %s before the next download", configuration.pauseAfterDownload) // Logs the pause so the run doesn't look stalled while it waits.
 			select {                                                                             // Waits for either the pause to elapse or a shutdown request, whichever comes first.
@@ -371,9 +381,15 @@ func downloadBookPDF(shutdownContext context.Context, httpClient *http.Client, c
 
 // performSingleDownloadAttempt performs exactly one HTTP GET request plus a
 // file write for a book's PDF, returning the number of bytes written on
-// success. It does not retry on its own; retrying is handled by the caller,
-// downloadBookPDF.
+// success. While streaming the response to disk it also computes a SHA-256
+// checksum of the bytes as they arrive; after the file is renamed into
+// place, it re-reads the file from disk and computes the checksum again to
+// confirm the two match, guarding against corruption introduced while
+// writing or renaming the file. It does not retry on its own; retrying is
+// handled by the caller, downloadBookPDF.
 func performSingleDownloadAttempt(shutdownContext context.Context, httpClient *http.Client, configuration runConfiguration, book catalogBook, finalFilePath string) (int64, error) { // Starts the single-attempt downloader.
+	log.Printf("requesting %s", book.Links.PDF) // Logs the exact URL this attempt is about to request, so the network activity is fully traceable in the logs.
+
 	httpRequest, requestBuildError := http.NewRequestWithContext(shutdownContext, http.MethodGet, book.Links.PDF, nil) // Builds a cancellable GET request for the book's PDF.
 	if requestBuildError != nil {                                                                                      // Checks whether the request object itself could not be constructed.
 		return 0, fmt.Errorf("building request: %w", requestBuildError) // Returns a wrapped request-construction error.
@@ -386,19 +402,25 @@ func performSingleDownloadAttempt(shutdownContext context.Context, httpClient *h
 	} // Ends the request-error check.
 	defer httpResponse.Body.Close() // Ensures the response body is always closed, even if the copy below fails.
 
+	log.Printf("received HTTP %d from %s (content-length=%s)", httpResponse.StatusCode, book.Links.PDF, httpResponse.Header.Get("Content-Length")) // Logs the response status and advertised size as soon as headers arrive, before any bytes are copied to disk.
+
 	if httpResponse.StatusCode < 200 || httpResponse.StatusCode >= 300 { // Checks whether the server returned a non-success (non-2xx) HTTP status code.
 		return 0, fmt.Errorf("HTTP %d", httpResponse.StatusCode) // Returns an error describing the unexpected status code.
 	} // Ends the status-code check.
 
 	temporaryFilePath := finalFilePath + ".part" // Builds the temporary-file path used while the download is still in progress.
 
+	log.Printf("writing to temporary file %s (will become %s on success)", temporaryFilePath, finalFilePath) // Logs both the temporary path being written to now and the final path it will be renamed to once complete.
+
 	temporaryFile, fileCreateError := os.Create(temporaryFilePath) // Creates (or truncates) the temporary file that the PDF will be streamed into.
 	if fileCreateError != nil {                                    // Checks whether the temporary file could not be created.
 		return 0, fmt.Errorf("creating temp file: %w", fileCreateError) // Returns a wrapped filesystem error.
 	} // Ends the file-creation check.
 
-	bytesWritten, copyError := io.Copy(temporaryFile, httpResponse.Body) // Streams the PDF response body into the temporary file, tracking how many bytes were written.
-	fileCloseError := temporaryFile.Close()                              // Closes the temporary file regardless of whether the copy above succeeded.
+	downloadChecksumHasher := sha256.New()                                          // Creates a SHA-256 hasher that will be fed every byte as it's streamed to disk, so we know the checksum of exactly what we downloaded.
+	temporaryFileAndHasher := io.MultiWriter(temporaryFile, downloadChecksumHasher) // Combines the temp file and the hasher into one writer, so a single io.Copy writes to both at once.
+	bytesWritten, copyError := io.Copy(temporaryFileAndHasher, httpResponse.Body)   // Streams the PDF response body into the temporary file (and the hasher), tracking how many bytes were written.
+	fileCloseError := temporaryFile.Close()                                         // Closes the temporary file regardless of whether the copy above succeeded.
 
 	if copyError != nil { // Checks whether the copy failed partway through (e.g. the connection dropped mid-download).
 		os.Remove(temporaryFilePath)                        // Removes the incomplete temporary file so it can never be mistaken for a finished download.
@@ -410,13 +432,53 @@ func performSingleDownloadAttempt(shutdownContext context.Context, httpClient *h
 		return 0, fmt.Errorf("closing file: %w", fileCloseError) // Returns a wrapped close error.
 	} // Ends the close-error check.
 
+	downloadedChecksum := hex.EncodeToString(downloadChecksumHasher.Sum(nil))                                 // Renders the SHA-256 checksum computed while streaming as a hex string, e.g. "9f86d0...".
+	log.Printf("computed SHA-256 checksum of downloaded bytes for %s: %s", finalFilePath, downloadedChecksum) // Logs the checksum computed from the network stream, before anything is verified against disk.
+
+	log.Printf("renaming %s to %s", temporaryFilePath, finalFilePath) // Logs the final rename step that promotes the temp file to its permanent name and location.
+
 	if renameError := os.Rename(temporaryFilePath, finalFilePath); renameError != nil { // Atomically promotes the temporary file to its final filename, now that it's fully and correctly written.
 		os.Remove(temporaryFilePath)                           // Cleans up the temporary file if the rename itself failed.
 		return 0, fmt.Errorf("renaming file: %w", renameError) // Returns a wrapped rename error.
 	} // Ends the rename check.
 
+	log.Printf("verifying checksum of %s against downloaded checksum %s", finalFilePath, downloadedChecksum) // Logs that we're about to re-read the file from disk to confirm it matches what we downloaded.
+
+	onDiskChecksum, checksumError := computeSHA256ChecksumOfFile(finalFilePath) // Re-reads the final file from disk and computes its checksum independently of the in-memory one above.
+	if checksumError != nil {                                                   // Checks whether the file could not be read back for verification.
+		os.Remove(finalFilePath)                                                               // Removes the file, since we can't confirm it's intact.
+		return 0, fmt.Errorf("reading file back for checksum verification: %w", checksumError) // Returns a wrapped checksum-verification error.
+	} // Ends the checksum-read check.
+
+	if onDiskChecksum != downloadedChecksum { // Checks whether the checksum of the bytes on disk matches the checksum computed while downloading.
+		os.Remove(finalFilePath)                                                                                                      // Removes the corrupted file so it isn't mistaken for a good download on the next run.
+		return 0, fmt.Errorf("checksum mismatch for %s: downloaded=%s on-disk=%s", finalFilePath, downloadedChecksum, onDiskChecksum) // Returns a descriptive checksum-mismatch error.
+	} // Ends the checksum-comparison check.
+
+	log.Printf("checksum verified OK for %s: %s", finalFilePath, onDiskChecksum) // Logs that the file on disk was confirmed to exactly match what was downloaded.
+
 	return bytesWritten, nil // Returns the number of bytes successfully written to the final file.
 } // Ends performSingleDownloadAttempt.
+
+// computeSHA256ChecksumOfFile opens the file at the given path and streams
+// its full contents through a SHA-256 hasher, returning the resulting
+// checksum as a lowercase hex string. It is used after a download completes
+// to confirm the bytes actually sitting on disk match the bytes that were
+// streamed in from the network.
+func computeSHA256ChecksumOfFile(filePath string) (string, error) { // Starts the file-checksum helper.
+	openedFile, openError := os.Open(filePath) // Opens the file for reading; this does not load it all into memory at once.
+	if openError != nil {                      // Checks whether the file could not be opened.
+		return "", fmt.Errorf("opening file: %w", openError) // Returns a wrapped open error.
+	} // Ends the open-error check.
+	defer openedFile.Close() // Ensures the file handle is always closed once this function returns.
+
+	checksumHasher := sha256.New()                                             // Creates a fresh SHA-256 hasher for this file.
+	if _, copyError := io.Copy(checksumHasher, openedFile); copyError != nil { // Streams the entire file through the hasher in fixed-size chunks, without loading it all into memory.
+		return "", fmt.Errorf("hashing file: %w", copyError) // Returns a wrapped hashing error.
+	} // Ends the copy-error check.
+
+	return hex.EncodeToString(checksumHasher.Sum(nil)), nil // Returns the final checksum as a lowercase hex string.
+} // Ends computeSHA256ChecksumOfFile.
 
 // ---------------------------------------------------------------------------
 // Shared helpers
