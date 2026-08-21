@@ -11,7 +11,7 @@ function main() { # Define the main function that contains all script logic
 
 	# ---------------- Configuration ----------------
 
-	CHECK_INTERVAL_SECONDS=60     # Wait 60 seconds between each repository check
+	CHECK_INTERVAL_SECONDS=30     # Wait 30 seconds between each repository check
 	MIN_WAIT_SECONDS=1800         # Force push at least every 1800 seconds (30 min)
 	MIN_FILE_CHANGE_THRESHOLD=10  # Push early if 10+ files have changed
 
